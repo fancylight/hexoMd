@@ -41,5 +41,40 @@ maven中插件实际上就是按照maven标准开发的jar,每个`plugin`包含�
         </pluginGroups>
         ```
 ## 常见插件
-###
-a's'd
+官方插件可以去看jar包结构,一般都存在一个`plugin.xml`描述了该插件的mojo信息,
+同时使用`mvn plugin:help -Ddetail=ture -Dgoal=xx`可以显示该goal的参数信息
+### clean插件
+#### 功能
+默认删除`project.build.directory`,`project.build.outputDirectory`,`project.build.testOutputDirectory`,`project.reporting.outputDirectory`
+- 删除额外的文件
+```xml
+<build>
+  <plugin>
+    <artifactId>maven-clean-plugin</artifactId>
+    <version>3.1.0</version>
+    <configuration>
+      <filesets>
+        <fileset>
+          <directory>some/relative/path</directory>
+          <includes>
+            <include>**/*.tmp</include>
+            <include>**/*.log</include>
+          </includes>
+          <excludes>
+            <exclude>**/important.log</exclude>
+            <exclude>**/another-important.log</exclude>
+          </excludes>
+          <followSymlinks>false</followSymlinks>
+        </fileset>
+      </filesets>
+    </configuration>
+  </plugin>
+</build>
+```
+- 跳过clean阶段
+maven中一些去其他的插件也是如此跳过的,如负责执行JUnit 的`surefire`插件
+```
+<configuration>
+<skip>ture</skip>
+</configuration>
+```
