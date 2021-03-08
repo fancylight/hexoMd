@@ -5,7 +5,7 @@ tag:
 - 框架
 - spring
 categories: java
-cover: /img/spring.png
+cover: /img/spring.pnga
 top_img: /img/post.jpg
 ---
 ### 概述

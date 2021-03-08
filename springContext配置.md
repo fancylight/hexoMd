@@ -1,6 +1,6 @@
 ---
 title: springContext配置
-cover: /img/post.jpg
+cover: /img/spring.png
 top_img: /img/post.jpg
 date: 2020-04-08 09:08:05
 tags:
@@ -10,9 +10,27 @@ tags:
 categories: java
 description: springContext配置基础设施配置
 ---
-# compoent-scan
-## 代码逻辑
+# 概述
+用于描述springxml关于`context`的ns部分在源码中的实现,以及其使用场景,该ns对应的`NamespaceHandler`如下:
+```java
+public class ContextNamespaceHandler extends NamespaceHandlerSupport {
 
+	@Override
+	public void init() {
+		registerBeanDefinitionParser("property-placeholder", new PropertyPlaceholderBeanDefinitionParser());
+		registerBeanDefinitionParser("property-override", new PropertyOverrideBeanDefinitionParser());
+		registerBeanDefinitionParser("annotation-config", new AnnotationConfigBeanDefinitionParser());
+		registerBeanDefinitionParser("component-scan", new ComponentScanBeanDefinitionParser());
+		registerBeanDefinitionParser("load-time-weaver", new LoadTimeWeaverBeanDefinitionParser());
+		registerBeanDefinitionParser("spring-configured", new SpringConfiguredBeanDefinitionParser());
+		registerBeanDefinitionParser("mbean-export", new MBeanExportBeanDefinitionParser());
+		registerBeanDefinitionParser("mbean-server", new MBeanServerBeanDefinitionParser());
+	}
+
+}
+```
+## compoent-scan
+### 代码逻辑
 {%codeblock lang:java ComponentScanBeanDefinitionParser%}
         public BeanDefinition parse(Element element, ParserContext parserContext) {
       String basePackage = element.getAttribute(BASE_PACKAGE_ATTRIBUTE);
@@ -20,7 +38,7 @@ description: springContext配置基础设施配置
       String[] basePackages = StringUtils.tokenizeToStringArray(basePackage,
           ConfigurableApplicationContext.CONFIG_LOCATION_DELIMITERS);
 
-      // Actually scan for bean definitions and register them.
+      // Actually scan for bean definitions and register them
       //调用该Scanner来处理
       ClassPathBeanDefinitionScanner scanner = configureScanner(parserContext, element);
       //返回在对应的classPath 正确注解的bean
@@ -30,7 +48,7 @@ description: springContext配置基础设施配置
       return null;
     }
 {%endcodeblock%}
-## 总结
+### 总结
 - ClassPathBeanDefinitionScanner:这个才是实际扫描路径并创建的sbd的类
 spring处理注解@ComponentScan注解最终也要用到该类,外层是ComponentScanAnnotationParser
 具体注解处理的代码分析可以参考,[springBoot学习一](/2019/09/05/springBoot学习一/#applicationcontextinitializer).
@@ -67,7 +85,7 @@ spring处理注解@ComponentScan注解最终也要用到该类,外层是Componen
 }
 {%endcodeblock%}
 对于AnnotationConfigUtils参考[context相关](/2019/09/05/springBoot学习一/#boot中context)
-# load-time-weaver
+## load-time-weaver
 - 代码逻辑
 {%codeblock lang:java LoadTimeWeaverBeanDefinitionParser%}
 public static final String ASPECTJ_WEAVING_ENABLER_BEAN_NAME =
@@ -119,15 +137,15 @@ protected void doParse(Element element, ParserContext parserContext, BeanDefinit
 }
 
 {%endcodeblock%}
-## 总结
+### 总结
 创建`DefaultContextLoadTimeWeaver`GBD和`AspectJWeavingEnabler`
-简单来说LWT就是载入时织入,与spring aop实现点不同,后者是运行时编译
-# property-
-`property-placeholder`和`property-override`,前者用来提供处理bd中`${}`的功能,后者
+简单来说LWT就是载入时织入,与spring aop实现点不同,后者是运行时织入
+## property-
+`property-placeholder`和`property-override`,前者用来提供处理bd中`${}`的功能,后者用来替换bean对应的属性
 - xml解析器
 {%asset_img PropretyBDP.png%}
 这是一个`AbstractSingleBeanDefinitionParser`子类,参考[NamespaceHandler](/2020/02/11/spring常见/#NamespaceHandler体系)
-## property-placeholder`
+## property-placeholder
 ### 代码逻辑
 {%codeblock lang:java AbstractPropertyLoadingBeanDefinitionParser%}
 abstract class AbstractPropertyLoadingBeanDefinitionParser extends AbstractSingleBeanDefinitionParser {
