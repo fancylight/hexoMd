@@ -75,6 +75,9 @@ private volatile int state; //改变量表示AQS本身的资源,并非是节点�
  ## AQS执行逻辑
  {% asset_img 多线程Ⅲ----AQS/2021-03-08-22-29-21.png %}
  AQS的实现类都会维护资源,当NODE能够`获得`资源时就会进行执行状态,否则就会处于阻塞状态
+ 首先说明一下,AQS源码在jdk8,11,13中都有一些变化,这里以11为说明
+ ps:
+ AQS中采用的LockSupport的park和unpark是采取标记使用的,并不是一定要先park,再unpark,unpark相当于设置了一个标志,park相当于消费该标志
  ### 独占模式
  #### 获取
  {%codeblock lang:java %} 
@@ -167,12 +170,26 @@ private volatile int state; //改变量表示AQS本身的资源,并非是节点�
         return Thread.interrupted();
     }
  {%endcodeblock%}
- - 队列初始化时队列可能的情况
-    - 线程A通过tryAcquire函数,队列为空;线程B进入,创建了 空NODE<---->线程BNODE,若此时线程A未释放,则线程Bpark
-    - 当线程A释放之后,线程B会充当head,并且此时状态为0
- - 当后续线程进入shouldParkAfterFailedAcquire,说明前驱节点很多,或者head节点处于持有资源的状态
-    - 当前驱为0,说明当前节点第一次进入此函数,置前驱为-1,并使当前节点再次尝试获取资源
-    - 当前驱为1,说明当前节点第二次进入此函数,直接进入park状态
+ - addWaiter的逻辑:即插入指定模式的节点到队尾
+    {%asset_img 初始化节点状态.png %}
+    - 图1为线程A通过tryAcquire,获取资源,并未在队列中创建节点;当线程B执行tryAcquire失败时,则会创建代表线程A的虚拟节点和代表本身的节点,节点状态都为0
+    - 图2表示存在三个线程,第一个线程在执行,第二个线程处于park状态或刚执行完入队函数,第三个线程为刚进入队尾的状态,处于这种状态的不是一个稳定状态
+    - 由于AQS本身会被多线程调用,很多时候队列的状态是时刻发生改变的,如图二中第二个线程可能处于刚进入tail,并未park的时候,第三个线程也进入队尾
+ - acquireQueued循环的作用:当前线程循环尝试获取资源,以及park
+     {%asset_img 节点循环获取资源.png %}
+    - 当图2中的队尾线程执行完shouldparkAfter函数之后,就会变成图3的情况
+    - 当队首的next节点能够获取到资源时,就会执行出队操作,替代队首,并且
+ -  shouldParkAfterFailedAcquire作用
+    - 情况2:修正取消节点,将当前节点的pre连接到最前方正常的节点,并且取消正常前置的next
+    - 情况3:即前置线程节点处于0或者-3,前者表示当前线程是刚进入队列第一次执行,那么就需要将前置节点置为-1,此时返回false;当前线程会尝试再次获取资源,如果不能获取,
+    会进入情况1,进而park;也有可能会由于前置变为1,而进入取消节点修正
+    - 情况1:即前置线程节点处于-1,第二次进入该函数,说明当前节点应该直接执行park函数,由于park的标志特性不用去管这个判断过程中前置唤醒和该节点park的顺序
+    - 情况2和情况3都相当于进行了二次检查(可以理解为自我激活)
+        {%asset_img 自我激活.png%}
+    - 如图5所示,若存在线程A,B,如果线程A快速获取并释放资源,线程B未进入到shouldParkAfterFailedAcquire函数,那么在release中是不会执行唤醒后续线程的操作(因为队首waitStatus=0),
+    那么此时线程B就需要自我唤醒,便出现了在shouldparkAfter函数中先执行情况3,然后再尝试获取资源,此时会将队首出队
+    - 如图6所示,当线程A,B,C快速进入队列,并且B,C未执行should函数就会是这种状态,当B线程出现异常被取消后,会变成图6状态,此时如果C线程执行了should函数之后会变成图7状态,如果该过程中
+    线程A释放了,那么就和图5的逻辑是一样,因此此时线程C也需要一个自我再次检查的过程      
  #### 释放
 {%codeblock lang:java%} 
     
@@ -187,7 +204,8 @@ private volatile int state; //改变量表示AQS本身的资源,并非是节点�
     }
 {%endcodeblock%}
 - release()函数过程中,若队首为null,说明在线程A获取到释放的过程中没有任意另外线程尝试获取过资源,那么AQS直接退出就行
-- release()函数过程中,若head.waitStatus==0,说明有线程B进入到队列,但是在执行到shouldParkAfterFailedAcquire中修改pre.waitStatus=-1之前线程A就执行结束了
+- release()函数过程中,若head.waitStatus==0,说明有线程B进入到队列,但是在执行到shouldParkAfterFailedAcquire中修改pre.waitStatus=-1之前线程A就执行结束了,即线程A还没有执行过修改
+前置线程的状态,那么他还会去执行should函数的3情况,还有机会再次去获取资源,因此该线程也可以安全释放
 {%codeblock lang:java%} 
  private void unparkSuccessor(Node node) {
         /*
@@ -219,6 +237,8 @@ private volatile int state; //改变量表示AQS本身的资源,并非是节点�
     }
 
 {%endcodeblock%}
+若不存在异常,没有节点处于取消状态,那么队列状态是比较规整的,如下:
+{%asset_img 共享无取消状态图.png 共享无取消状态%}
 ### 取消动作
 AQS中取消发生于超时,或者异常,并不是对外的Api,如独占模式下获取acquireQueued函数过程中异常,则会取消该节点(即等待过程中出现异常)
 {%codeblock lang:java%}
