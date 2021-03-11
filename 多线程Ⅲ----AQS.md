@@ -10,7 +10,7 @@ categories:
 - java
 description: java并发学
 ---
-# 概述
+# AQS
 本文用来描述并发包中AQS的原理,AbstractQueuedSynchronizer内部使用了双向队列实现了阻塞锁以及相关的同步器
 ## AQS数据结构
 - 内部节点
@@ -69,8 +69,11 @@ private volatile int state; //改变量表示AQS本身的资源,并非是节点�
 
 ```
 - 节点状态说明
- 状态0:表示节点刚加入队列  
+ 状态0:初始状态
  状态1:表示节点取消,即请求资源的线程取消动作  
+ 状态-1:表示自身释放时需要`唤醒`后继节点(此时后继节点未必陷入了park状态)
+ 状态-2:条件等待
+ 状态-3:只有head才有可能是这个状态,表示SHARE模式下,后继节点未进行shouldPark操作
  ---
  ## AQS执行逻辑
  {% asset_img 多线程Ⅲ----AQS/2021-03-08-22-29-21.png %}
@@ -78,8 +81,9 @@ private volatile int state; //改变量表示AQS本身的资源,并非是节点�
  首先说明一下,AQS源码在jdk8,11,13中都有一些变化,这里以11为说明
  ps:
  - AQS中采用的LockSupport的park和unpark是采取标记使用的,并不是一定要先park,再unpark,unpark相当于设置了一个标志,park相当于消费该标志
- - 本文中采用唤醒表示unpark不是很合适,将这个操作理解为设置一次通行标志,线程是否能够通过acquire取决于`资源`是否能够获取
+ - 本文中采用`唤醒`表示unpark不是很合适,将这个操作理解为设置一次通行标志,线程是否能够通过acquire取决于`资源`是否能够获取
  - AQS中CLH队列节点状态由于多线程访问的原因,某一时刻状态可能存在多种情况,不是很好分析
+ - AQS中dummy节点表示是第一个获取到资源的线程,队列第二位置是下一个能够获取到资源的线程节点
  ### 入队操作
  AQS中CLH队列使用pre来稳定的表示节点关系,next实际上是一种优化,思路是这样,当多个线程同时插入,通过循环加cas维护tail的正确性,此时新的节点对于不同线程
  来说就是局部变量,修改pre一定是正确
@@ -339,5 +343,87 @@ private void cancelAcquire(Node node) {
   {%asset_img 队尾取消操作.png%}
   - 前两张图表示无新线程节点导致cas失败,那么后续过程就和一般流程一致
   - 后三张图表示当出现cas失败,那么取消节点的清除就要延迟到存在新线程节点执行shouldParkAfterFailedAcquire函数
-- 若为队中,则会直接尝试唤醒取消节点的后续节点,等待进入一次shouldParkAfterFailedAcquire,修正后续节点的pre正确性
-- 若为第二个位置,说明了队首可以改为-1状态,并且如果当前节点.next为正常节点改变队首.next为当前.next,这样unparkSuccessor函数中可以直接唤醒next
+- 若为第二个位置,则会直接尝试唤醒取消节点的后续节点,等待进入一次shouldParkAfterFailedAcquire,修正后续节点的pre正确性
+- 若为队中,则尝试改变pred.waitstatus=-1,并且尝试连接pred.next为取消节点.next
+### 共享模式
+共享和独占模式的区别在于后者每次唤醒是不会唤醒后续节点,也就是如果由于资源不够而进入CLH队列的节点,每次只能存在一个线程被唤醒;
+而前者则会尝试反复唤醒,直到资源不够使用
+#### 获取
+{%codeblock lang:java%}
+ public final void acquireShared(int arg) {
+        if (tryAcquireShared(arg) < 0)
+            doAcquireShared(arg);
+    }
+
+  private void doAcquireShared(int arg) {
+      //加入队列的是SHARED类型的节点
+        final Node node = addWaiter(Node.SHARED);
+        boolean interrupted = false;
+        try {
+            for (;;) {
+                final Node p = node.predecessor();
+                if (p == head) {
+                    int r = tryAcquireShared(arg);
+                    if (r >= 0) { 
+                        //当处于第二位置的线程能够获取资源,会出队,并且尝试是否要唤醒后继
+                        setHeadAndPropagate(node, r);
+                        p.next = null; // help GC
+                        return;
+                    }
+                }
+                if (shouldParkAfterFailedAcquire(p, node))
+                    interrupted |= parkAndCheckInterrupt();
+            }
+        } catch (Throwable t) {
+            cancelAcquire(node);
+            throw t;
+        } finally {
+            if (interrupted)
+                selfInterrupt();
+        }
+    }  
+{%endcodeblock%}
+#### 释放
+{%codeblock lang:java%}
+public final boolean releaseShared(int arg) {
+        if (tryReleaseShared(arg)) {
+            doReleaseShared();
+            return true;
+        }
+        return false;
+    }
+ private void doReleaseShared() {
+        for (;;) {
+            Node h = head;
+            if (h != null && h != tail) {
+                int ws = h.waitStatus;
+                if (ws == Node.SIGNAL) {
+                    if (!h.compareAndSetWaitStatus(Node.SIGNAL, 0))
+                        continue;            // loop to recheck cases
+                    unparkSuccessor(h);
+                }
+                else if (ws == 0 &&
+                         !h.compareAndSetWaitStatus(0, Node.PROPAGATE))
+                    continue;                // loop on failed CAS
+            }
+            if (h == head)                   // loop if head changed
+                break;
+        }
+    }    
+{%endcodeblock%}
+#### 共享状态下状态分析
+##### 理想状态下
+{%asset_img 一般流程中的共享状态图.png %}
+- 假设资源为2,线程依次进入队列,并逐步释放,为上图
+##### 共享模式下Propagate作用
+{%asset_img 共享模式下Propagate作用.png%}
+设置资源为2,可能会出现一种极端情况,假设没有状态Propagate的参与,[AQS1.73和1.74的改变](http://gee.cs.oswego.edu/cgi-bin/viewcvs.cgi/jsr166/src/main/java/util/concurrent/locks/AbstractQueuedSynchronizer.java?r1=1.73&r2=1.74)
+- 状态1为时刻1,当A线程释放后,oldHead.waitStatus=0,并且会使线程C进入setHeadAndPropagate,进行出队操作,
+- 若出队的操作未执行时,线程D开始了释放操作,并在它执行完成之前入队操作都没有结束,由于此刻线程D看到的head实际是oldHead,那么如果不存在Propagate状态,它所看到的就是0状态,那么应该退出,如状态2
+- 到了状态3,线程C执行setHeadAndPropagate不会唤醒线程D(因为在线程C的执行过程中它所看到的剩余资源是0,即线程B和线程C持有,它没有观测到线程C的释放)
+在加入了Propagate状态后,通过`  if (propagate > 0 || h == null || h.waitStatus < 0 ||(h = head) == null || h.waitStatus < 0) `,可以判读oldHead可能存在的0->-3的转变,以此观测到新的资源释放,
+来唤醒后续资源.
+- 这种状态可能会引起该节点永久挂起,假设状态3,再有一个节点进入队列,那么新节点是可以获取资源的,就会造成中间有节点没有被唤醒,线程C和线程D的节点会被出队,线程D还处于阻塞状态
+-----
+## 参考
+[Propagate作用](https://blog.csdn.net/zy353003874/article/details/110535122)
