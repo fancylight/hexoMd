@@ -8,7 +8,7 @@ tags:
 - 并发
 categories:
 - java
-description: java并发学习
+description: 条件协作机制
 ---
 # Condition
 JDK中使用ConditionObject(AQS)中内部类来实现,实际上和`Object.wait|Object.notify`,都是线程协作机制
@@ -150,3 +150,94 @@ public final void await() throws InterruptedException {
 - 图三,时刻t3,线程C加入队列,并且等待获取锁
 - 图四,时刻t4,线程C获得锁,并且调用了signal操作,从而将A节点加入了同步线程,当线程C执行release时,会将线程A唤醒
 从而继续执行await中代码,使得A线程重新参与AQS竞争
+### 原生Wait和LOCK.AWAIT使用差别
+共性:
+- 都需要在获取锁的情况下使用(这是协作机制从逻辑上的保证)
+- 都可以响应中断
+考虑以下情况,分别使用wait和Condition分别实现阻塞队列
+{%codeblock lang:java 基于wait的阻塞队列%}
+public class SimpleWaitBlockArray<T> {
+    private volatile int size;
+    private Object[] arrays = new Object[100];//默认最大值为100
+
+    public T take() {
+        T object = null;
+        synchronized (arrays) {
+            try {
+                while (size == 0) {
+                    arrays.wait();
+                }
+                object = dequeue();
+                arrays.notify();
+            } catch (InterruptedException e) {
+                e.printStackTrace();
+            }
+        }
+        return object;
+    }
+
+    public void put(T ele) {
+        synchronized (arrays) {
+            try {
+                while (size == 100) {
+                    arrays.wait();
+                }
+                enqueue(ele);
+                arrays.notify();
+            } catch (InterruptedException e) {
+                e.printStackTrace();
+            }
+        }
+    }
+}    
+{%endcodeblock%}
+下边为JDK的ArrayBlockQueue实现
+{%codeblock lang:java ArrayBlockQueue%}
+public class ArrayBlockingQueue<E> extends AbstractQueue<E>
+        implements BlockingQueue<E>, java.io.Serializable {
+    /** Main lock guarding all access */
+    final ReentrantLock lock;
+
+    /** Condition for waiting takes */
+    private final Condition notEmpty;
+
+    /** Condition for waiting puts */
+    private final Condition notFull;
+
+ public E take() throws InterruptedException {
+        final ReentrantLock lock = this.lock;
+        lock.lockInterruptibly();
+        try {
+            while (count == 0)
+                notEmpty.await();
+            return dequeue();
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    public void put(E e) throws InterruptedException {
+        Objects.requireNonNull(e);
+        final ReentrantLock lock = this.lock;
+        lock.lockInterruptibly();
+        try {
+            while (count == items.length)
+                notFull.await();
+            enqueue(e);
+        } finally {
+            lock.unlock();
+        }
+    }  
+}    
+{%endcodeblock%}
+可以明显看到原生的结构必须是
+```java
+  synchronized (obj) {
+      obj.wait();
+      //....
+      obj.notify();
+  }
+```
+这个结构在上边的实现中所带来的问题是,假设当所有生产者处于waitting状态,如果此时任意生产被唤醒,
+向队列里插入了数据,并调用notify,此时并不能保证唤醒的是消费者,缺乏效率,也就说jdk原生结构过于死板,不够灵活.
+反而使用AQS结构的Condition可以做到唤醒指定方.
