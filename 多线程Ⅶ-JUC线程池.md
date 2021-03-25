@@ -1,5 +1,5 @@
 ---
-title: 多线程Ⅶ---线程池
+title: 多线程Ⅶ---JUC线程池
 cover: /img/java.png
 top_img: /img/post.jpg
 tags:
@@ -511,3 +511,129 @@ private Runnable getTask() {
         }
 }    
 ```
+### ThreadPoolExecutor的三种常见使用
+使用`Executors.newxx`这个api除了`newWorkStealingPool`和`newScheduledThreadPool`实际上就是创建参数不同的`ThreadPollExecutor`,构造器如下
+```java
+ public ThreadPoolExecutor(int corePoolSize,
+                              int maximumPoolSize,
+                              long keepAliveTime,
+                              TimeUnit unit,
+                              BlockingQueue<Runnable> workQueue,
+                              ThreadFactory threadFactory,
+                              RejectedExecutionHandler handler) {
+        if (corePoolSize < 0 ||
+            maximumPoolSize <= 0 ||
+            maximumPoolSize < corePoolSize ||
+            keepAliveTime < 0)
+            throw new IllegalArgumentException();
+        if (workQueue == null || threadFactory == null || handler == null)
+            throw new NullPointerException();
+        this.corePoolSize = corePoolSize;
+        this.maximumPoolSize = maximumPoolSize;
+        this.workQueue = workQueue;
+        this.keepAliveTime = unit.toNanos(keepAliveTime);
+        this.threadFactory = threadFactory;
+        this.handler= handler;
+    }
+```
+- threadFactory的作用是用来创建Thread,该thread会调用Woker中的run函数从而执行runWork,假设需要获取线程异常信息,可以通过重写一个threadFactory
+    ```java
+    //这是Exectuors中默认实现之一,并没有给线程增加异常处理
+    private static class DefaultThreadFactory implements ThreadFactory {
+            private static final AtomicInteger poolNumber = new AtomicInteger(1);
+            private final ThreadGroup group;
+            private final AtomicInteger threadNumber = new AtomicInteger(1);
+            private final String namePrefix;
+
+            DefaultThreadFactory() {
+                SecurityManager s = System.getSecurityManager();
+                group = (s != null) ? s.getThreadGroup() :
+                                    Thread.currentThread().getThreadGroup();
+                namePrefix = "pool-" +
+                            poolNumber.getAndIncrement() +
+                            "-thread-";
+            }
+
+            public Thread newThread(Runnable r) {
+                Thread t = new Thread(group, r,
+                                    namePrefix + threadNumber.getAndIncrement(),
+                                    0);
+                if (t.isDaemon())
+                    t.setDaemon(false);
+                if (t.getPriority() != Thread.NORM_PRIORITY)
+                    t.setPriority(Thread.NORM_PRIORITY);
+                //可以加上异常处理
+                t.setUncaughtExceptionHandler(()->{
+                    //捕捉异常,将信息输出,或者保存下来
+                })    
+                return t;
+            }
+        }
+    ```
+- newCachedThreadPool:适用于任务耗时非常短的场景
+    ```java
+    public static ExecutorService newCachedThreadPool(ThreadFactory threadFactory) {
+            return new ThreadPoolExecutor(0, Integer.MAX_VALUE,
+                                        60L, TimeUnit.SECONDS,
+                                        new SynchronousQueue<Runnable>(),
+                                        threadFactory);
+        }
+    ```
+`corePoolSize`为0,`keepAliveTime`为60秒,`blockQueue`为`SynchronousQueue`,使用过程中不会创建核心线程,并且任务队列最多只能由一个任务,若任务队列被阻塞,则会伴随着非核心线程的创建,每个非核心线程的阻塞等待时间是60s,适用场景就是不确定线程数量,每个任务非常短的情况使用
+- newFixedThreadPool:固定工作线程
+    ```java
+    public static ExecutorService newFixedThreadPool(int nThreads, ThreadFactory threadFactory) {
+            return new ThreadPoolExecutor(nThreads, nThreads,
+                                        0L, TimeUnit.MILLISECONDS,
+                                        new LinkedBlockingQueue<Runnable>(),
+                                        threadFactory);
+        }
+    ```
+`corePoolSize`和`maximumPollSize`相同,阻塞队列为无界阻塞队列`LinkedBlockingQueue`,不会创建非核心线程,并且核心线程正常情况不会退出,任务队列是无界的,适用场景是用户要确定任务量,和线程数量
+- newSingleThreadExecutor:单一线程
+    ```java
+    public static ExecutorService newSingleThreadExecutor(ThreadFactory threadFactory) {
+            return new FinalizableDelegatedExecutorService
+                (new ThreadPoolExecutor(1, 1,
+                                        0L, TimeUnit.MILLISECONDS,
+                                        new LinkedBlockingQueue<Runnable>(),
+                                        threadFactory));
+        }
+    ```
+仅仅创建一个核心线程,任务队列采用无界阻塞队列,当然当该线程退出(异常),会有新的核心工作线程来替代它,适用于执行顺序任务.
+## ScheduledExecutorService
+JUC中实现的用来延迟执行和定时执行的线程池
+{% asset_img 多线程Ⅶ-JUC线程池/2021-03-23-19-40-48.png %}
+```java
+//延迟执行,无结果
+public ScheduledFuture<?> schedule(Runnable command,
+                                       long delay, TimeUnit unit);
+//延迟执行,有结果
+ public <V> ScheduledFuture<V> schedule(Callable<V> callable,
+                                           long delay, TimeUnit unit);                                       
+//延迟第一个,周期执行之后的,无结果
+public ScheduledFuture<?> scheduleAtFixedRate(Runnable command,
+                                                  long initialDelay,
+                                                  long period,
+                                                  TimeUnit unit);   
+//每个任务调用直接存在延迟                                                         
+public ScheduledFuture<?> scheduleWithFixedDelay(Runnable command,
+                                                     long initialDelay,
+                                                     long delay,
+                                                     TimeUnit unit);                                                                                   
+```
+简单使用:
+```java
+  @Test
+    public void ScheduledThreadPoolExecutorTest() throws ExecutionException, InterruptedException {
+        ScheduledExecutorService scheduledExecutorService = Executors.newScheduledThreadPool(4);
+        AtomicInteger count = new AtomicInteger();
+        //延迟执行
+        ScheduledFuture<Integer> schedule = scheduledExecutorService.schedule(count::incrementAndGet, 5, TimeUnit.SECONDS);
+        Assertions.assertEquals(schedule.get(),1);
+        //周期执行
+        scheduledExecutorService.scheduleAtFixedRate(()-> System.out.println(count.incrementAndGet()), 2, 2, TimeUnit.SECONDS);
+        Thread.currentThread().sleep(1000*16);
+    }
+```
+## FutreTask实现原理
