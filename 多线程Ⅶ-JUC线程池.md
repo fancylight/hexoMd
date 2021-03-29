@@ -9,7 +9,7 @@ categories:
 description: JUC线程池
 ---
 # JUC线程池
-线程池分为两部分,一个是传统的`ThreadPoolExecutor`以及分治使用的`ForkJoinPool`,接口如下:
+`ThreadPoolExecutor`以及分治使用的`ForkJoinPool`,接口如下:
 {% asset_img 2021-03-22-10-14-43.png %}
 核心接口是`Executor`,这里涉及到`Runnable`,`Future`,`Callable`,,`FutureTask`的使用
 {%codeblock lang:java AbstractExecutorService%}
@@ -637,3 +637,388 @@ public ScheduledFuture<?> scheduleWithFixedDelay(Runnable command,
     }
 ```
 ## FutreTask实现原理
+### 无锁栈Treiber stack
+通过CAS循环实现的最简单的栈,可以进行并发操作,并且能够保证线程安全,结构就是循环取旧值,cas操作失败再循环执行,这本身就是一个数据结构,并不是起到像AQS替代锁的作用.
+```java
+public class FutureTaskTest {
+    //实现一个无锁栈
+    static class Node<T> {
+        private Object object;
+        private Node next;
+
+        public Node(Object object) {
+            this.object = object;
+        }
+    }
+
+    static class NonLockStack<T> {
+        private AtomicReference<Node<T>> head =new AtomicReference<>();
+        private AtomicInteger atomicInteger =new AtomicInteger();
+
+        public void put(T ele) {
+            Node<T> tempNode = null;
+            Node newNode = new Node(ele);
+            do {
+                //明显可以看出来这个循环内部就是临界区,由于CAS循环的作用,这个区域是线程安全的
+                //如果此次有第二个成员变量,如size,这个for循环没有办法处理,该操作,原因是cas只能一次处理一个变量,无法将两个变量同时处理
+
+                tempNode = head.get();
+                newNode.next = tempNode;
+            } while (!head.compareAndSet(tempNode, newNode));
+            //此处内部和上班while循环的实质是一样的
+            atomicInteger.getAndIncrement();
+        }
+    }
+
+    @Test
+    public void pushTest() {
+        CountDownLatch countDownLatch = new CountDownLatch(1000);
+        NonLockStack<Integer> nonLockStack = new NonLockStack<>();
+        for (int i = 0; i < 1000; i++) {
+            int finalI = i;
+            new Thread(() -> {
+                nonLockStack.put(finalI);
+                countDownLatch.countDown();
+            }).start();
+        }
+        try {
+            countDownLatch.await();
+        } catch (InterruptedException e) {
+            e.printStackTrace();
+        }
+        Assertions.assertEquals(nonLockStack.atomicInteger.get(), 1000);
+    }
+}
+```
+### FutureTask内部结构
+```java
+public class FutureTask<V> implements RunnableFuture<V> {
+    private volatile int state;
+    private static final int NEW          = 0;
+    private static final int COMPLETING   = 1;
+    private static final int NORMAL       = 2;
+    private static final int EXCEPTIONAL  = 3;
+    private static final int CANCELLED    = 4;
+    private static final int INTERRUPTING = 5;
+    private static final int INTERRUPTED  = 6;
+    private Callable<V> callable; //真正的任务
+    //最终结果,该变量没有被volatile修饰是因为happend-before,state的volatile传递性,和AQS能够保证可见性的原因一致
+    private Object outcome; // non-volatile, protected by state reads/writes            
+    private volatile Thread runner;//执行命令的线程
+    private volatile WaitNode waiters;//无锁栈
+}    
+```
+### 运行逻辑
+- run:`FutureTask`被线程池`Worker`调用时真正的任务执行的逻辑
+```java
+  public void run() {
+      //判断状态
+        if (state != NEW ||
+            !RUNNER.compareAndSet(this, null, Thread.currentThread()))
+            return;
+        try {
+            Callable<V> c = callable;
+            if (c != null && state == NEW) {
+                V result;
+                boolean ran;
+                try {
+                    result = c.call(); //调用任务,等待返回值
+                    ran = true;
+                } catch (Throwable ex) {
+                    result = null;
+                    ran = false;
+                    setException(ex); //异常结束,设置异常状态
+                }
+                if (ran)
+                    set(result); //正常结束,设置正常结束状态
+            }
+        } finally {
+            // runner must be non-null until state is settled to
+            // prevent concurrent calls to run()
+            runner = null;
+            // state must be re-read after nulling runner to prevent
+            // leaked interrupts
+            int s = state;
+            if (s >= INTERRUPTING)
+                handlePossibleCancellationInterrupt(s);
+        }
+    }
+
+     protected void setException(Throwable t) {
+        if (STATE.compareAndSet(this, NEW, COMPLETING)) {  //call返回后,未最终设置状态时,为ing状态
+            outcome = t;
+            STATE.setRelease(this, EXCEPTIONAL); // final state
+            finishCompletion();//唤醒那些由于get函数而阻塞的线程
+        }
+    }
+
+     protected void set(V v) {
+        if (STATE.compareAndSet(this, NEW, COMPLETING)) {
+            outcome = v;
+            STATE.setRelease(this, NORMAL); // final state
+            finishCompletion();
+        }
+    }
+```
+- get:通过无锁栈结构阻塞线程
+```java
+ public V get() throws InterruptedException, ExecutionException {
+        int s = state;
+        if (s <= COMPLETING) //等待状态,尝试阻塞
+            s = awaitDone(false, 0L); 
+        return report(s);
+    }
+
+
+private int awaitDone(boolean timed, long nanos)
+        throws InterruptedException {
+        long startTime = 0L;    // Special value 0L means not yet parked
+        WaitNode q = null;
+        boolean queued = false;
+        for (;;) {
+            int s = state;
+            if (s > COMPLETING) { //返回结果状态
+                if (q != null)
+                    q.thread = null;
+                return s;
+            }
+            else if (s == COMPLETING) //让出cpu等待状态设置完毕
+                // We may have already promised (via isDone) that we are done
+                // so never return empty-handed or throw InterruptedException
+                Thread.yield();
+            else if (Thread.interrupted()) { //中断了则可能从park状态通过,出队,并且抛出中断异常
+                removeWaiter(q);
+                throw new InterruptedException();
+            }
+            else if (q == null) { //创建node
+                if (timed && nanos <= 0L)
+                    return s;
+                q = new WaitNode();
+            }
+            else if (!queued) //压栈
+                queued = WAITERS.weakCompareAndSet(this, q.next = waiters, q);  //无锁栈入队操作
+            else if (timed) { //超时等待
+                final long parkNanos;
+                if (startTime == 0L) { // first time
+                    startTime = System.nanoTime();
+                    if (startTime == 0L)
+                        startTime = 1L;
+                    parkNanos = nanos;
+                } else {
+                    long elapsed = System.nanoTime() - startTime;
+                    if (elapsed >= nanos) {
+                        removeWaiter(q);
+                        return state;
+                    }
+                    parkNanos = nanos - elapsed;
+                }
+                // nanoTime may be slow; recheck before parking
+                if (state < COMPLETING) 
+                    LockSupport.parkNanos(this, parkNanos);
+            }
+            else
+                LockSupport.park(this); //阻塞
+        }
+    }
+    //出队操作
+    private void removeWaiter(WaitNode node) {
+        if (node != null) {
+            node.thread = null;
+            retry:
+            for (;;) {          // restart on removeWaiter race
+                for (WaitNode pred = null, q = waiters, s; q != null; q = s) {
+                    s = q.next;
+                    if (q.thread != null)
+                        pred = q;
+                    else if (pred != null) {
+                        pred.next = s;
+                        if (pred.thread == null) // check for race
+                            continue retry;
+                    }
+                    else if (!WAITERS.compareAndSet(this, q, s))
+                        continue retry;
+                }
+                break;
+            }
+        }
+    }    
+```
+- 唤醒和完成操作:
+```java
+    private void finishCompletion() {
+        // assert state > COMPLETING;
+        //唤醒所有等待的线程
+        for (WaitNode q; (q = waiters) != null;) {
+            if (WAITERS.weakCompareAndSet(this, q, null)) {
+                for (;;) {
+                    Thread t = q.thread;
+                    if (t != null) {
+                        q.thread = null;
+                        LockSupport.unpark(t);
+                    }
+                    WaitNode next = q.next;
+                    if (next == null)
+                        break;
+                    q.next = null; // unlink to help gc
+                    q = next;
+                }
+                break;
+            }
+        }
+
+        done(); //回调函数
+
+        callable = null;        // to reduce footprint
+    }
+
+```
+## ForkJoinPool
+## CompletionService
+考虑一下场景,使用线程池创建多个任务,并且要获取任务结果,那么代码如下:
+```java
+  static class FutureTask1 implements Callable<Integer> {
+        int result;
+
+        public FutureTask1(int result) {
+            this.result = result;
+        }
+
+        @Override
+        public Integer call() throws Exception {
+            synchronized (this) {
+                this.wait(1000);
+            }
+            return result;
+        }
+    }
+
+
+public void futureTest() {
+        for (int i = 0; i < FUTURE_TASK_SIZE; i++) {
+            taskList.add(executorService.submit(new FutureTask1(i)));
+        }
+        taskList.forEach(f-> {
+            try {
+                Object result = f.get();
+                doSomething(result);//假设存在一个任务执行时间过长,那么就会阻塞后边的任务
+            } catch (InterruptedException e) {
+                e.printStackTrace();
+            } catch (ExecutionException e) {
+                e.printStackTrace();
+            }
+        });
+    }
+```
+假设任务`FutureTask1`的每次调用占用时间不同,那么for循环结构必须按照顺序等待任务结束,若一个任务执行时间过程则会导致后边的任务阻塞等待,那么如果采用轮询和超时等待方式:
+```java
+  @Test
+    public void futurePollTest() {
+
+        for (int i = 0; i < FUTURE_TASK_SIZE; i++) {
+            taskList.add(executorService.submit(new FutureTask1(i)));
+        }
+        //轮询
+        while (!taskList.isEmpty()) {
+            Iterator<Future<Integer>> iterator = taskList.iterator();
+            while (iterator.hasNext()) {
+                try {
+                    Future<Integer> next = iterator.next();
+                    next.get(0, TimeUnit.SECONDS);
+                } catch (InterruptedException e) {
+                    System.out.println("等待过程线程被中断,退出");
+                    return;
+                } catch (ExecutionException e) {
+                    e.printStackTrace();
+                    System.out.println("数据获取过程发生异常,删除该任务");
+                    iterator.remove();
+                    continue;
+                } catch (TimeoutException e) {
+                    System.out.println("等待超时,重新尝试");
+                    continue;
+                }
+                iterator.remove();
+            }
+        }
+    }
+```
+这样也是不能解决上述问题,假设每次获取iterator的时候去打乱list的顺序,也不是一个好方法,因为打乱的执行没有逻辑,为了解决该问题,使用`CompletionService`
+### 接口定义
+```java
+public interface CompletionService<V> {
+
+    Future<V> submit(Callable<V> task);
+    Future<V> submit(Runnable task, V result);
+    //获取执行完成的结果,若未有完成的则阻塞
+    Future<V> take() throws InterruptedException;
+    Future<V> poll();
+    Future<V> poll(long timeout, TimeUnit unit) throws InterruptedException;
+}
+```
+由`take`和`poll`就可以看出来,这个玩意内部使用了阻塞队列实现,通过submit设置任务,当任务完成进入完成阻塞队列(生产者),调用线程使用`take().get()`来获取最新完成的(消费者),例子如下:
+```java
+  @Test
+    public void completionServiceTest() {
+        CompletionService<Integer> completionService = new ExecutorCompletionService(executorService);
+        for (int i = 0; i < FUTURE_TASK_SIZE; i++) {
+            completionService.submit(new FutureTask1(i));
+        }
+        for (int i = 0; i < FUTURE_TASK_SIZE; i++) { //再非异常的情况下,应该执行FUTURE_TASK_SIZE次
+            try {
+                System.out.println(completionService.take().get()); //此处永远会获取最新完成的
+            } catch (InterruptedException e) {
+                e.printStackTrace();
+            } catch (ExecutionException e) {
+                e.printStackTrace();
+            }
+        }
+    }
+```
+
+### ExecutorCompletionService实现
+该类实现非常简单,就是使用阻塞队列实现
+```java
+public class ExecutorCompletionService<V> implements CompletionService<V> {
+    private final Executor executor; //实际的执行器
+    private final AbstractExecutorService aes;
+    private final BlockingQueue<Future<V>> completionQueue; //阻塞队列
+
+    private static class QueueingFuture<V> extends FutureTask<Void> {
+        QueueingFuture(RunnableFuture<V> task,
+                       BlockingQueue<Future<V>> completionQueue) {
+            super(task, null);
+            this.task = task;
+            this.completionQueue = completionQueue;
+        }
+        private final Future<V> task;
+        private final BlockingQueue<Future<V>> completionQueue;
+        protected void done() { completionQueue.add(task); } //注意此处将真正的task封装进了阻塞队列
+    }    
+    public ExecutorCompletionService(Executor executor,
+                                     BlockingQueue<Future<V>> completionQueue) {
+        if (executor == null || completionQueue == null)
+            throw new NullPointerException();
+        this.executor = executor;
+        this.aes = (executor instanceof AbstractExecutorService) ?
+            (AbstractExecutorService) executor : null;
+        this.completionQueue = completionQueue;
+    }    
+    public Future<V> submit(Callable<V> task) {
+        if (task == null) throw new NullPointerException();
+        //封装创建Future,让线程池执行
+        RunnableFuture<V> f = newTaskFor(task);
+        executor.execute(new QueueingFuture<V>(f, completionQueue));
+        return f;
+    }    
+    //阻塞队列消费
+    public Future<V> take() throws InterruptedException {
+        return completionQueue.take();
+    }
+
+    public Future<V> poll() {
+        return completionQueue.poll();
+    }    
+```
+
+
+----
+[CompletionService参考](https://segmentfault.com/a/1190000023587881)

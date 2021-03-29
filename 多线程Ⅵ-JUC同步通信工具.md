@@ -666,7 +666,7 @@ private int internalAwaitAdvance(int phase, QNode node) {
             }
             else if (node.isReleasable()) // done or aborted , 判断节点是否应该被释放
                 break;
-            else if (!queued) {           // push onto queue   新的节点入队
+            else if (!queued) {           // push onto queue   新的节点压栈
                 AtomicReference<QNode> head = (phase & 1) == 0 ? evenQ : oddQ; //根据phase取奇偶队列
                 QNode q = node.next = head.get();
                 if ((q == null || q.phase == phase) &&
